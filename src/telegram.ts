@@ -1,5 +1,6 @@
 import { renderTelegramHtml } from "./rendering.js";
 import { renderStructuredResponse, validActionUrl } from "./responses/render.js";
+import { localizedSafeFallback, validateStructuredResponse } from "./responses/validate.js";
 import type { StructuredResponse, TelegramActionRow } from "./responses/types.js";
 
 const TELEGRAM_CHUNK_SIZE = 4000;
@@ -32,6 +33,20 @@ export const HELP_TEXT = `Я отвечаю на практические воп
 • Что посмотреть за 3 дня?
 • Какой район выбрать с ребёнком?
 • Где обычно выгоднее менять доллары?`;
+
+const PAYLOAD_KEYS = ["kind", "language", "places", "reason_to_choose", "map_url"];
+
+/** Detects serialized internal Ploy transport, not arbitrary user-requested JSON. */
+export function containsStructuredPayload(text: string): boolean {
+  const trimmed = text.trim().replace(/&quot;/g, '"').replace(/&amp;/g, "&").replace(/&#39;/g, "'");
+  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return false;
+  try {
+    const value = JSON.parse(trimmed) as unknown;
+    if (!value || typeof value !== "object") return false;
+    const serialized = JSON.stringify(value);
+    return PAYLOAD_KEYS.filter((key) => serialized.includes(`"${key}"`)).length >= 2;
+  } catch { return false; }
+}
 
 export function splitMessage(text: string, limit = TELEGRAM_CHUNK_SIZE): string[] {
   const chunks: string[] = [];
@@ -109,7 +124,16 @@ export async function processUpdate(
     const result = await deps.answer(message.text.trim());
     const answer = typeof result === "string" ? { text: result, usedWebSearch: false } : result;
     const renderStartedAt = Date.now();
-    const rendered = answer.structured ? renderStructuredResponse(answer.structured) : undefined;
+    // Validate again at the handler boundary: routing/model objects can never reach the renderer or sender.
+    const structured = answer.structured ? validateStructuredResponse(answer.structured) : undefined;
+    const structuredMode = Boolean(answer.structured);
+    const fallback = localizedSafeFallback(message.text);
+    let rendered;
+    try {
+      rendered = structured ? renderStructuredResponse(structured) : structuredMode ? renderStructuredResponse(fallback) : undefined;
+    } catch {
+      rendered = renderStructuredResponse(fallback);
+    }
     (deps.log ?? console).info?.("OpenAI request succeeded", {
       durationMs: Date.now() - startedAt,
       web_search_used: Boolean(answer.usedWebSearch),
@@ -123,7 +147,15 @@ export async function processUpdate(
       structured_response_valid: answer.structuredResponseValid ?? Boolean(answer.structured),
       render_duration_ms: Date.now() - renderStartedAt,
     });
-    await deps.send(chatId, rendered?.text ?? renderTelegramHtml(answer.text), rendered?.actions);
+    let outgoing = rendered?.text ?? renderTelegramHtml(answer.text);
+    let actions = rendered?.actions;
+    // Last structured-mode gate immediately before sendMessage.
+    if (structuredMode && containsStructuredPayload(outgoing)) {
+      const safe = renderStructuredResponse(fallback);
+      outgoing = safe.text;
+      actions = safe.actions;
+    }
+    await deps.send(chatId, outgoing, actions);
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     (deps.log ?? console).error("Could not generate or deliver an AI response", {

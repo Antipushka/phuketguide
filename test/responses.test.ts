@@ -3,10 +3,35 @@ import test from "node:test";
 import { routeResponseKind } from "../src/responses/router.js";
 import { renderStructuredResponse } from "../src/responses/render.js";
 import type { StructuredResponse } from "../src/responses/types.js";
+import { PLOY_RESPONSE_SCHEMA } from "../src/responses/schema.js";
+import { validateStructuredResponse } from "../src/responses/validate.js";
 
 test("routes the ten core intents without network access", () => {
   const cases: Array<[string, string]> = [["Какие рестораны открыты?", "places_list"], ["Стоит ли идти в Catch?", "place_detail"], ["Weather now", "weather"], ["Что сегодня происходит на Пхукете?", "events"], ["Where exchange USD to THB?", "rate"], ["Где арендовать машину?", "rental_list"], ["Где лучше жить месяц?", "area_recommendation"], ["Bang Tao или Rawai?", "comparison"], ["Что посмотреть за один день?", "itinerary"], ["Как купить SIM-карту?", "general"]];
   for (const [input, kind] of cases) assert.equal(routeResponseKind(input), kind, input);
+});
+
+test("final response schema is strict, closed, and fully discriminated", () => {
+  assert.equal(PLOY_RESPONSE_SCHEMA.oneOf.length, 12);
+  for (const contract of PLOY_RESPONSE_SCHEMA.oneOf) assert.equal(contract.additionalProperties, false);
+  const weather = PLOY_RESPONSE_SCHEMA.oneOf.find((contract) => (contract.properties.kind as { const?: string }).const === "weather");
+  assert.ok(weather?.required.includes("heading"));
+  assert.ok(weather?.required.includes("temperature"));
+  assert.ok(weather?.required.includes("condition"));
+});
+
+test("runtime validation rejects incomplete weather and locale-shaped language", () => {
+  assert.equal(validateStructuredResponse({ kind: "weather", language: "ru-RU" }), undefined);
+  assert.equal(validateStructuredResponse({ kind: "weather", language: "ru" }), undefined);
+  assert.ok(validateStructuredResponse({ kind: "weather", language: "ru", heading: "Погода", temperature: "+29°C", condition: "Ясно" }));
+});
+
+test("runtime validation removes a bad optional URL without dropping its place", () => {
+  const result = validateStructuredResponse({ kind: "places_list", language: "ru", heading: "Места", items: [{ name: "Будда", reason_to_choose: "Вид", map_url: "Будда Пхукета" }] });
+  assert.equal(result?.kind, "places_list");
+  if (result?.kind !== "places_list") assert.fail("expected places list");
+  assert.equal(result.items[0].map_url, undefined);
+  assert.match(renderStructuredResponse(result).actions[0][0].url, /google\.com\/maps\/search/);
 });
 
 test("renders place cards, omits absent metadata and builds safe indexed actions", () => {
