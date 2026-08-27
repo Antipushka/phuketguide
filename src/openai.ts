@@ -2,9 +2,9 @@ import OpenAI from "openai";
 import type { Response } from "openai/resources/responses/responses";
 import { SYSTEM_PROMPT } from "./prompt.js";
 import { getPhuketDateTime, phuketDateTimeContext } from "./time.js";
-import { removeHistoricalWeatherBlock } from "./rendering.js";
 import { routeResponseKind } from "./responses/router.js";
-import { safeGeneral, validateStructuredResponse } from "./responses/validate.js";
+import { PLOY_RESPONSE_SCHEMA } from "./responses/schema.js";
+import { validateStructuredResponse } from "./responses/validate.js";
 import type { StructuredResponse } from "./responses/types.js";
 
 export const OPENAI_TIMEOUT_MS = 25_000;
@@ -18,6 +18,12 @@ export interface AnswerResult {
   freshnessWarning: boolean;
   structured?: StructuredResponse;
   structuredResponseValid: boolean;
+}
+
+export function localizedSafeFallback(question: string): string {
+  if (/[а-яё]/i.test(question)) return "Сейчас не получилось подготовить ответ. Попробуй ещё раз через минуту.";
+  if (/[฀-๿]/.test(question)) return "ตอนนี้ยังไม่สามารถเตรียมคำตอบได้ โปรดลองอีกครั้งในอีกสักครู่";
+  return "I couldn't prepare an answer right now. Please try again in a minute.";
 }
 
 export interface ResponsesClient {
@@ -166,7 +172,7 @@ export async function generateAnswer(client: ResponsesClient, model: string, que
       tools: [{ type: "web_search", external_web_access: true, search_context_size: "medium", user_location: { type: "approximate", city: "Phuket", region: "Phuket", country: "TH", timezone: "Asia/Bangkok" } }],
       tool_choice: freshnessSensitiveQuery ? "required" : "auto",
       include: ["web_search_call.action.sources"],
-      text: { format: { type: "json_schema", name: "ploy_response", strict: false, schema: { type: "object", properties: { kind: { type: "string" }, language: { type: "string" } }, required: ["kind", "language"], additionalProperties: true } } },
+      text: { format: { type: "json_schema", name: "ploy_response", strict: true, schema: PLOY_RESPONSE_SCHEMA } },
       max_output_tokens: 900,
     }, { signal });
   } catch (error) {
@@ -180,13 +186,16 @@ export async function generateAnswer(client: ResponsesClient, model: string, que
   const freshnessWarning = freshnessSensitiveQuery && (!usedWebSearch || uniqueSources.length === 0 || uniqueSources.every((source) => looksHistorical(source, Number(today.slice(0, 4)))));
   let parsed: unknown;
   try { parsed = JSON.parse(response.output_text); } catch { parsed = undefined; }
-  const validated = validateStructuredResponse(parsed);
-  const weatherCleaned = route.current_weather && !validated ? removeHistoricalWeatherBlock(response.output_text) : response.output_text;
-  const cleaned = route.open_now ? filterOpenNowAnswer(weatherCleaned, route.fallback) : weatherCleaned;
-  const fallbackStructured: StructuredResponse = { kind: "freshness_fallback", language: "other", heading: route.fallback.trim(), explanation: route.fallback.trim() };
-  const structured = freshnessWarning ? fallbackStructured : (validated ?? safeGeneral(cleaned));
-  const text = freshnessWarning ? route.fallback.trim() : (validated ? response.output_text : deduplicateParagraphs(cleaned));
-  if (!text.trim()) throw new Error("OpenAI returned an empty response");
+  let validated = validateStructuredResponse(parsed);
+  if (route.open_now && validated?.kind === "places_list") {
+    validated.items = validated.items.filter((item) => item.open_status === "open");
+    if (!validated.items.length) validated = undefined;
+  }
+  const fallback = freshnessWarning ? route.fallback.trim() : localizedSafeFallback(question);
+  const fallbackStructured: StructuredResponse = { kind: "freshness_fallback", language: "other", heading: fallback, explanation: fallback };
+  const structured = freshnessWarning || !validated ? fallbackStructured : validated;
+  // output_text is transport data in structured mode and must never become display text.
+  const text = fallback;
   return {
     text,
     usedWebSearch,

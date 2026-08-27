@@ -19,6 +19,19 @@ export interface BotAnswer {
   freshnessWarning?: boolean;
 }
 
+function localizedFallback(question: string): string {
+  if (/[а-яё]/i.test(question)) return "Сейчас не получилось получить ответ. Попробуй ещё раз через минуту.";
+  if (/[฀-๿]/.test(question)) return "ตอนนี้ยังไม่สามารถรับคำตอบได้ โปรดลองอีกครั้งในอีกสักครู่";
+  return "I couldn't get an answer right now. Please try again in a minute.";
+}
+
+/** Detects only the bot's internal structured transport, not arbitrary user-requested JSON. */
+export function containsInternalStructuredPayload(text: string): boolean {
+  const fields = ["kind", "language", "places", "items", "reason_to_choose", "map_url", "website_url"];
+  const hits = fields.filter((field) => new RegExp(`(?:^|[,{])\\s*['\"]${field}['\"]\\s*:`, "m").test(text));
+  return hits.includes("kind") && hits.includes("language") && hits.length >= 3;
+}
+
 export const START_TEXT = `Привет! Я Ploy — твой локальный помощник по Пхукету.
 
 Можешь просто написать, что тебя интересует: куда сходить, где поесть, какой район выбрать, где арендовать машину или байк, где жить или что посмотреть.
@@ -109,7 +122,14 @@ export async function processUpdate(
     const result = await deps.answer(message.text.trim());
     const answer = typeof result === "string" ? { text: result, usedWebSearch: false } : result;
     const renderStartedAt = Date.now();
-    const rendered = answer.structured ? renderStructuredResponse(answer.structured) : undefined;
+    let rendered;
+    if (answer.structured) {
+      try {
+        rendered = renderStructuredResponse(answer.structured);
+      } catch (error) {
+        (deps.log ?? console).error("Could not render structured response", error instanceof Error ? error.name : "UnknownError");
+      }
+    }
     (deps.log ?? console).info?.("OpenAI request succeeded", {
       durationMs: Date.now() - startedAt,
       web_search_used: Boolean(answer.usedWebSearch),
@@ -123,7 +143,14 @@ export async function processUpdate(
       structured_response_valid: answer.structuredResponseValid ?? Boolean(answer.structured),
       render_duration_ms: Date.now() - renderStartedAt,
     });
-    await deps.send(chatId, rendered?.text ?? renderTelegramHtml(answer.text), rendered?.actions);
+    const structuredMode = Boolean(answer.structured || answer.structuredResponseValid);
+    let outgoing = rendered?.text ?? (structuredMode ? localizedFallback(message.text) : renderTelegramHtml(answer.text));
+    let actions = rendered?.actions;
+    if (structuredMode && containsInternalStructuredPayload(outgoing)) {
+      outgoing = localizedFallback(message.text);
+      actions = undefined;
+    }
+    await deps.send(chatId, outgoing, actions);
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     (deps.log ?? console).error("Could not generate or deliver an AI response", {

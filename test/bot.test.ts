@@ -4,6 +4,8 @@ import type { Response } from "openai/resources/responses/responses";
 import { getConfig } from "../src/config.js";
 import { deduplicateParagraphs, generateAnswer, normalizeSourceUrl, type ResponsesClient } from "../src/openai.js";
 import { HELP_TEXT, START_TEXT, processUpdate, splitMessage } from "../src/telegram.js";
+import { renderStructuredResponse } from "../src/responses/render.js";
+import { validateStructuredResponse } from "../src/responses/validate.js";
 
 test("configuration validates required secrets and defaults the model", () => {
   assert.throws(() => getConfig({}));
@@ -273,4 +275,68 @@ test("open-now answer safety gate retains only explicitly verified venue blocks"
   const answer = filterOpenNowAnswer("Two verified places:\n\nA is open. [STATUS:OPEN]\n\nB is closed. [STATUS:CLOSED]\n\nC uncertain. [STATUS:UNKNOWN]\n\nD is open. [STATUS:OPEN]", "Could not verify.");
   assert.match(answer, /A is open/); assert.match(answer, /D is open/);
   assert.doesNotMatch(answer, /B is closed|C uncertain|STATUS/);
+});
+
+async function runStructuredPipeline(outputText: string, question = "Куда сходить на Пхукете?") {
+  const sent: Array<{ text: string; actions?: unknown[] }> = [];
+  const client = clientWith(response([], outputText), undefined, { freshness_sensitive: false, fallback: "Свежие данные недоступны." });
+  await processUpdate({ message: { chat: { id: 77 }, text: question } }, {
+    answer: (text) => generateAnswer(client, "gpt-test", text),
+    send: async (_id, text, actions) => { sent.push({ text, actions }); },
+    log: { info() {}, error() {} },
+  });
+  return sent[0];
+}
+
+test("handler pipeline renders places JSON as Telegram cards without transport leakage", async () => {
+  const raw = JSON.stringify({ kind: "places_list", language: "ru", heading: "Куда сходить", items: [{ name: "Большой Будда", area: "Chalong", reason_to_choose: "Панорамный вид", map_url: "https://maps.google.com/?q=Big+Buddha" }] });
+  const sent = await runStructuredPipeline(raw);
+  assert.match(sent.text, /<b>1\. Большой Будда<\/b>/);
+  assert.ok(sent.actions?.length);
+  assert.doesNotMatch(sent.text, /"kind"|reason_to_choose|map_url|\{"/);
+});
+
+test("live weather incomplete locale payload is replaced by localized fallback", async () => {
+  const sent = await runStructuredPipeline('{"kind":"weather","language":"ru-RU"}', "Какая погода сейчас?");
+  assert.match(sent.text, /не получилось/i);
+  assert.doesNotMatch(sent.text, /"kind"|ru-RU/);
+});
+
+test("weather validation requires heading, temperature and condition", () => {
+  assert.equal(validateStructuredResponse({ kind: "weather", language: "ru" }), undefined);
+  const valid = validateStructuredResponse({ kind: "weather", language: "ru", heading: "Пхукет", temperature: "+29°C", condition: "Ясно" });
+  assert.ok(valid);
+  assert.match(renderStructuredResponse(valid).text, /\+29°C.*Ясно/s);
+});
+
+test("invalid optional place URL is removed while a safe Maps fallback preserves the card", () => {
+  const valid = validateStructuredResponse({ kind: "places_list", language: "ru", heading: "Места", items: [{ name: "Будда Пхукета", area: "Chalong", reason_to_choose: "Вид", map_url: "Будда Пхукета" }] });
+  assert.ok(valid && valid.kind === "places_list");
+  assert.equal(valid.items[0].map_url, undefined);
+  const rendered = renderStructuredResponse(valid);
+  assert.match(rendered.text, /Будда Пхукета/);
+  assert.match(rendered.actions[0][0].url, /^https:\/\/www\.google\.com\/maps\/search\/\?api=1&query=/);
+});
+
+test("malformed structured JSON cannot reach Telegram", async () => {
+  const sent = await runStructuredPipeline('{"kind":"weather", broken');
+  assert.match(sent.text, /не получилось/i);
+  assert.doesNotMatch(sent.text, /broken|"kind"/);
+});
+
+test("renderer exceptions use a localized fallback", async () => {
+  const sent: string[] = [];
+  const broken = { kind: "general", language: "ru", get paragraphs(): string[] { throw new Error("render failed"); } };
+  await processUpdate({ message: { chat: { id: 1 }, text: "Расскажи" } }, { answer: async () => ({ text: "secret", structured: broken as never, structuredResponseValid: true }), send: async (_id, text) => { sent.push(text); }, log: { info() {}, error() {} } });
+  assert.match(sent[0], /не получилось/i);
+  assert.doesNotMatch(sent[0], /secret|render failed/);
+});
+
+test("outgoing structured guard blocks internal payload but non-structured JSON remains allowed", async () => {
+  const payload = '{"kind":"places_list","language":"ru","items":[],"reason_to_choose":"x"}';
+  const structured: string[] = [], ordinary: string[] = [];
+  await processUpdate({ message: { chat: { id: 1 }, text: "Куда сходить?" } }, { answer: async () => ({ text: payload, structuredResponseValid: true }), send: async (_id, text) => { structured.push(text); }, log: { info() {}, error() {} } });
+  await processUpdate({ message: { chat: { id: 1 }, text: "Покажи пример JSON" } }, { answer: async () => payload, send: async (_id, text) => { ordinary.push(text); }, log: { info() {}, error() {} } });
+  assert.doesNotMatch(structured[0], /"kind"/);
+  assert.match(ordinary[0], /"kind"/);
 });
