@@ -73,7 +73,7 @@ function clientWith(
 test("a stable request allows automatic selection without using web search", async () => {
   const result = await generateAnswer(clientWith(response([], "Bang Tao спокойнее ночью."), (params) => {
     assert.equal(params.tool_choice, "auto");
-    assert.deepEqual(params.tools, [{ type: "web_search", external_web_access: true, search_context_size: "medium" }]);
+    assert.deepEqual(params.tools, [{ type: "web_search", external_web_access: true, search_context_size: "medium", user_location: { type: "approximate", city: "Phuket", region: "Phuket", country: "TH", timezone: "Asia/Bangkok" } }]);
   }), "gpt-test", "Чем отличаются районы?");
   assert.equal(result.usedWebSearch, false);
 });
@@ -95,7 +95,7 @@ test("a time-sensitive query accepts a current relevant source and grounds the q
   ] as unknown as Response["output"];
   const result = await generateAnswer(clientWith(response(output, "Сейчас 29 °C."), (params) => {
     assert.match(String(params.instructions), /now\/today/);
-    assert.match(String(params.instructions), /Текущая дата: \d{4}-\d{2}-\d{2}/);
+    assert.match(String(params.instructions), /Current Phuket local datetime: \d{4}-\d{2}-\d{2} \d{2}:\d{2}/);
   }, { freshness_sensitive: true, fallback: "Не удалось подтвердить свежие данные." }), "gpt-test", "Какая погода сейчас на Пхукете?");
   assert.equal(result.freshnessWarning, false);
   assert.equal(result.freshnessSensitiveQuery, true);
@@ -211,4 +211,66 @@ test("a long live-search answer remains compatible with Telegram chunking", () =
   const chunks = splitMessage("вариант ".repeat(1_500));
   assert.ok(chunks.length > 1);
   assert.ok(chunks.every((chunk) => chunk.length <= 4_000));
+});
+
+import { filterOpenNow, getOpenStatus, getPhuketDateTime, isOpenToday, PHUKET_TIME_ZONE, phuketDateTimeContext, type WeeklyHours } from "../src/time.js";
+import { removeHistoricalWeatherBlock, renderTelegramHtml } from "../src/rendering.js";
+
+test("Phuket datetime is dynamically converted in Asia/Bangkok", () => {
+  const local = getPhuketDateTime(new Date("2026-08-27T17:28:00Z"));
+  assert.equal(PHUKET_TIME_ZONE, "Asia/Bangkok");
+  assert.deepEqual([local.date, local.time, local.weekday], ["2026-08-28", "00:28", "Friday"]);
+  assert.match(phuketDateTimeContext(new Date("2026-08-27T17:28:00Z")), /2026-08-28 00:28, Friday, Asia\/Bangkok \(UTC\+7\)/);
+});
+
+test("open-now honors midnight boundaries and previous-day overnight hours", () => {
+  const friday = 5;
+  assert.equal(getOpenStatus({ [friday]: [{ open: "07:30", close: "00:00" }] }, { time: "00:28", weekdayIndex: friday }), "CLOSED");
+  assert.equal(getOpenStatus({ 4: [{ open: "18:00", close: "02:00" }] }, { time: "01:00", weekdayIndex: friday }), "OPEN");
+  assert.equal(getOpenStatus(undefined, { time: "12:00", weekdayIndex: friday }), "UNKNOWN");
+});
+
+test("open today differs from open now", () => {
+  const hours: WeeklyHours = { 5: [{ open: "07:30", close: "00:00" }] };
+  assert.equal(isOpenToday(hours, 5), true);
+  assert.equal(getOpenStatus(hours, { time: "00:28", weekdayIndex: 5 }), "CLOSED");
+});
+
+test("open-now filtering excludes CLOSED and UNKNOWN without padding", () => {
+  const result = filterOpenNow([{ name: "A", status: "OPEN" as const }, { name: "B", status: "CLOSED" as const }, { name: "C", status: "UNKNOWN" as const }, { name: "D", status: "OPEN" as const }]);
+  assert.deepEqual(result.map((place) => place.name), ["A", "D"]);
+});
+
+test("Telegram renderer emits HTML compact links and removes source dumps, tracking and duplicates", () => {
+  const html = renderTelegramHtml("## **1. Place**\n[Подробнее](https://example.com/a?utm_source=openai)\n\n[Подробнее](https://example.com/a)\n\nSources:\n- snippet https://source.test");
+  assert.match(html, /<b>1\. Place<\/b>/);
+  assert.doesNotMatch(html, /\*\*|Sources:|utm_source|(^|>\s*)https:\/\/example\.com/m);
+  assert.equal((html.match(/<a /g) ?? []).length, 1);
+  assert.match(html, /href="https:\/\/example\.com\/a"/);
+});
+
+test("current weather cleanup does not append a historical block", () => {
+  assert.equal(removeHistoricalWeatherBlock("Now: 29 °C.\n\nHistorical climate averages: 28 °C."), "Now: 29 °C.");
+});
+
+test("current-message language instruction covers language changes", async () => {
+  for (const question of ["What weather now?", "Какая погода сейчас?", "อากาศตอนนี้เป็นอย่างไร"]) {
+    await generateAnswer(clientWith(response([], "answer"), (params) => assert.match(String(params.instructions), /language of THIS user message is authoritative/i)), "gpt-test", question);
+  }
+});
+
+test("Telegram sender disables previews and uses HTML parse mode", async () => {
+  const original = globalThis.fetch;
+  let body: Record<string, unknown> = {};
+  globalThis.fetch = async (_input, init) => { body = JSON.parse(String(init?.body)); return new Response(null, { status: 200 }); };
+  try { await (await import("../src/telegram.js")).createTelegramSender("token")(1, "<b>Hello</b>"); } finally { globalThis.fetch = original; }
+  assert.equal(body.parse_mode, "HTML");
+  assert.deepEqual(body.link_preview_options, { is_disabled: true });
+});
+
+test("open-now answer safety gate retains only explicitly verified venue blocks", async () => {
+  const { filterOpenNowAnswer } = await import("../src/openai.js");
+  const answer = filterOpenNowAnswer("Two verified places:\n\nA is open. [STATUS:OPEN]\n\nB is closed. [STATUS:CLOSED]\n\nC uncertain. [STATUS:UNKNOWN]\n\nD is open. [STATUS:OPEN]", "Could not verify.");
+  assert.match(answer, /A is open/); assert.match(answer, /D is open/);
+  assert.doesNotMatch(answer, /B is closed|C uncertain|STATUS/);
 });
