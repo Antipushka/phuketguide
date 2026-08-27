@@ -3,6 +3,9 @@ import type { Response } from "openai/resources/responses/responses";
 import { SYSTEM_PROMPT } from "./prompt.js";
 import { getPhuketDateTime, phuketDateTimeContext } from "./time.js";
 import { removeHistoricalWeatherBlock } from "./rendering.js";
+import { routeResponseKind } from "./responses/router.js";
+import { safeGeneral, validateStructuredResponse } from "./responses/validate.js";
+import type { StructuredResponse } from "./responses/types.js";
 
 export const OPENAI_TIMEOUT_MS = 25_000;
 
@@ -13,6 +16,8 @@ export interface AnswerResult {
   sourceCount: number;
   freshnessSensitiveQuery: boolean;
   freshnessWarning: boolean;
+  structured?: StructuredResponse;
+  structuredResponseValid: boolean;
 }
 
 export interface ResponsesClient {
@@ -26,6 +31,7 @@ interface FreshnessRoute {
   fallback: string;
   open_now?: boolean;
   current_weather?: boolean;
+  response_kind?: string;
 }
 
 class LocalizedAnswerError extends Error {
@@ -55,8 +61,9 @@ async function classifyFreshness(client: ResponsesClient, model: string, questio
             fallback: { type: "string" },
             open_now: { type: "boolean" },
             current_weather: { type: "boolean" },
+            response_kind: { type: "string", enum: ["places_list", "place_detail", "weather", "events", "rate", "rental_list", "property_list", "area_recommendation", "comparison", "itinerary", "general"] },
           },
-          required: ["freshness_sensitive", "fallback", "open_now", "current_weather"],
+          required: ["freshness_sensitive", "fallback", "open_now", "current_weather", "response_kind"],
           additionalProperties: false,
         },
       },
@@ -146,6 +153,7 @@ export async function generateAnswer(client: ResponsesClient, model: string, que
   // One shared deadline covers both the semantic router and the answer/search call.
   const signal = AbortSignal.timeout(OPENAI_TIMEOUT_MS);
   const route = await classifyFreshness(client, model, question, signal);
+  const responseKind = route.response_kind || routeResponseKind(question);
   const freshnessSensitiveQuery = route.freshness_sensitive;
   const local = getPhuketDateTime();
   const today = local.date;
@@ -153,11 +161,12 @@ export async function generateAnswer(client: ResponsesClient, model: string, que
   try {
     response = await client.responses.create({
       model,
-      instructions: `${SYSTEM_PROMPT}\n\nThe language of THIS user message is authoritative; ignore the language of earlier turns. ${phuketDateTimeContext()}. ${freshnessSensitiveQuery ? "Запрос зависит от свежести: сформулируй поисковый запрос с now/today и текущей датой; не используй архив как подтверждение текущего состояния." : ""} ${route.open_now ? "OPEN NOW MODE: recommend only businesses whose published weekday-specific hours prove they are OPEN at the supplied Phuket time. Correctly evaluate overnight intervals. Exclude CLOSED, UNKNOWN, ambiguous, and merely open-today businesses. Return no more than 5; if few are verified, return only those. Never label an unverified place open. Put every venue in one separate paragraph ending exactly [STATUS:OPEN]; this private marker is mandatory and will be removed before delivery. Do not mark a venue unless its status is proven." : ""} ${route.current_weather ? "CURRENT WEATHER MODE: give one concise current observation or the freshness fallback. Never append climate averages, historical, archive, or source-dump sections." : ""}`,
+      instructions: `${SYSTEM_PROMPT}\n\nThe language of THIS user message is authoritative; ignore earlier turns. ${phuketDateTimeContext()}. Return a structured ${responseKind} response, never HTML, Markdown, citations, source lists, or Telegram objects. Use language ru, en, th, or other for this message. Omit facts that were not reliably established. Lists contain 2–5 items and every recommendation item has a specific reason_to_choose. Link fields are only map_url, website_url, or instagram_url and must identify the exact official place. ${freshnessSensitiveQuery ? "Search for now/today with the current date; archives cannot prove current facts." : ""} ${route.open_now ? "OPEN NOW MODE: include only venues proven open at the supplied Phuket weekday/time; exclude closed or unknown venues and cap at 5." : ""} ${route.current_weather ? "CURRENT WEATHER MODE: return current conditions and at most a short today_summary unless a multi-day forecast was requested." : ""}`,
       input: question,
       tools: [{ type: "web_search", external_web_access: true, search_context_size: "medium", user_location: { type: "approximate", city: "Phuket", region: "Phuket", country: "TH", timezone: "Asia/Bangkok" } }],
       tool_choice: freshnessSensitiveQuery ? "required" : "auto",
       include: ["web_search_call.action.sources"],
+      text: { format: { type: "json_schema", name: "ploy_response", strict: false, schema: { type: "object", properties: { kind: { type: "string" }, language: { type: "string" } }, required: ["kind", "language"], additionalProperties: true } } },
       max_output_tokens: 900,
     }, { signal });
   } catch (error) {
@@ -169,9 +178,14 @@ export async function generateAnswer(client: ResponsesClient, model: string, que
   const uniqueSources = deduplicateSources(evidenceSources);
   const sources = uniqueSources.map((source) => source.url);
   const freshnessWarning = freshnessSensitiveQuery && (!usedWebSearch || uniqueSources.length === 0 || uniqueSources.every((source) => looksHistorical(source, Number(today.slice(0, 4)))));
-  const weatherCleaned = route.current_weather ? removeHistoricalWeatherBlock(response.output_text) : response.output_text;
+  let parsed: unknown;
+  try { parsed = JSON.parse(response.output_text); } catch { parsed = undefined; }
+  const validated = validateStructuredResponse(parsed);
+  const weatherCleaned = route.current_weather && !validated ? removeHistoricalWeatherBlock(response.output_text) : response.output_text;
   const cleaned = route.open_now ? filterOpenNowAnswer(weatherCleaned, route.fallback) : weatherCleaned;
-  const text = freshnessWarning ? route.fallback.trim() : deduplicateParagraphs(cleaned);
+  const fallbackStructured: StructuredResponse = { kind: "freshness_fallback", language: "other", heading: route.fallback.trim(), explanation: route.fallback.trim() };
+  const structured = freshnessWarning ? fallbackStructured : (validated ?? safeGeneral(cleaned));
+  const text = freshnessWarning ? route.fallback.trim() : (validated ? response.output_text : deduplicateParagraphs(cleaned));
   if (!text.trim()) throw new Error("OpenAI returned an empty response");
   return {
     text,
@@ -180,6 +194,8 @@ export async function generateAnswer(client: ResponsesClient, model: string, que
     sourceCount: evidenceSources.length,
     freshnessSensitiveQuery,
     freshnessWarning,
+    structured,
+    structuredResponseValid: Boolean(validated),
   };
 }
 
