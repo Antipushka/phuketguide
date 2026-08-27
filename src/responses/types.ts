@@ -25,3 +25,4 @@ export type StructuredResponse = PlacesList | PlaceDetail | Weather | Events | R
 export interface TelegramAction { text: string; url: string }
 export type TelegramActionRow = TelegramAction[];
 export interface RenderedResponse { text: string; sections: string[]; actions: TelegramActionRow[]; kind: ResponseKind; itemCount: number }
+export type RenderedTelegramResponse = RenderedResponse;

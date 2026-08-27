@@ -2,9 +2,9 @@ import OpenAI from "openai";
 import type { Response } from "openai/resources/responses/responses";
 import { SYSTEM_PROMPT } from "./prompt.js";
 import { getPhuketDateTime, phuketDateTimeContext } from "./time.js";
-import { removeHistoricalWeatherBlock } from "./rendering.js";
 import { routeResponseKind } from "./responses/router.js";
-import { safeGeneral, validateStructuredResponse } from "./responses/validate.js";
+import { PLOY_RESPONSE_SCHEMA } from "./responses/schema.js";
+import { localizedSafeFallback, validateStructuredResponse } from "./responses/validate.js";
 import type { StructuredResponse } from "./responses/types.js";
 
 export const OPENAI_TIMEOUT_MS = 25_000;
@@ -166,7 +166,7 @@ export async function generateAnswer(client: ResponsesClient, model: string, que
       tools: [{ type: "web_search", external_web_access: true, search_context_size: "medium", user_location: { type: "approximate", city: "Phuket", region: "Phuket", country: "TH", timezone: "Asia/Bangkok" } }],
       tool_choice: freshnessSensitiveQuery ? "required" : "auto",
       include: ["web_search_call.action.sources"],
-      text: { format: { type: "json_schema", name: "ploy_response", strict: false, schema: { type: "object", properties: { kind: { type: "string" }, language: { type: "string" } }, required: ["kind", "language"], additionalProperties: true } } },
+      text: { format: { type: "json_schema", name: "ploy_response", strict: true, schema: PLOY_RESPONSE_SCHEMA } },
       max_output_tokens: 900,
     }, { signal });
   } catch (error) {
@@ -181,11 +181,11 @@ export async function generateAnswer(client: ResponsesClient, model: string, que
   let parsed: unknown;
   try { parsed = JSON.parse(response.output_text); } catch { parsed = undefined; }
   const validated = validateStructuredResponse(parsed);
-  const weatherCleaned = route.current_weather && !validated ? removeHistoricalWeatherBlock(response.output_text) : response.output_text;
-  const cleaned = route.open_now ? filterOpenNowAnswer(weatherCleaned, route.fallback) : weatherCleaned;
   const fallbackStructured: StructuredResponse = { kind: "freshness_fallback", language: "other", heading: route.fallback.trim(), explanation: route.fallback.trim() };
-  const structured = freshnessWarning ? fallbackStructured : (validated ?? safeGeneral(cleaned));
-  const text = freshnessWarning ? route.fallback.trim() : (validated ? response.output_text : deduplicateParagraphs(cleaned));
+  const safeFallback = localizedSafeFallback(question);
+  const structured = freshnessWarning ? fallbackStructured : (validated ?? safeFallback);
+  // output_text is transport only in structured mode. It is never user-facing.
+  const text = freshnessWarning ? route.fallback.trim() : safeFallback.explanation;
   if (!text.trim()) throw new Error("OpenAI returned an empty response");
   return {
     text,
