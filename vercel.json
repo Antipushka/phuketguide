@@ -1,0 +1,9 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "buildCommand": null,
+  "outputDirectory": null,
+  "functions": {
+    "api/telegram.ts": { "maxDuration": 30 }
+  }
+}
