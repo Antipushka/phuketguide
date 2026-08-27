@@ -3,6 +3,15 @@ const TELEGRAM_CHUNK_SIZE = 4000;
 export interface TelegramMessage { chat: { id: number }; text?: string }
 export interface TelegramUpdate { update_id?: number; message?: TelegramMessage }
 export type SendMessage = (chatId: number, text: string) => Promise<void>;
+export type SendChatAction = (chatId: number, action: "typing") => Promise<void>;
+export interface BotAnswer {
+  text: string;
+  usedWebSearch?: boolean;
+  sources?: string[];
+  sourceCount?: number;
+  freshnessSensitiveQuery?: boolean;
+  freshnessWarning?: boolean;
+}
 
 export const START_TEXT = `Привет! Я PhuketGuide AI — твой AI-помощник по Пхукету.
 
@@ -46,13 +55,30 @@ export function createTelegramSender(token: string): SendMessage {
   };
 }
 
+export function createTelegramChatActionSender(token: string): SendChatAction {
+  return async (chatId, action) => {
+    const response = await fetch(`https://api.telegram.org/bot${token}/sendChatAction`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, action }),
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (!response.ok) throw new Error(`Telegram chat action failed with status ${response.status}`);
+  };
+}
+
 function command(text: string): string | undefined {
   return text.trim().split(/\s+/, 1)[0]?.toLowerCase().replace(/@phuketguide_ai_bot$/, "");
 }
 
 export async function processUpdate(
   update: TelegramUpdate,
-  deps: { answer: (text: string) => Promise<string>; send: SendMessage; log?: Pick<Console, "error"> },
+  deps: {
+    answer: (text: string) => Promise<string | BotAnswer>;
+    send: SendMessage;
+    sendChatAction?: SendChatAction;
+    log?: Pick<Console, "error"> & Partial<Pick<Console, "info">>;
+  },
 ): Promise<void> {
   const message = update.message;
   if (!message || typeof message.text !== "string" || !message.text.trim()) return;
@@ -61,12 +87,44 @@ export async function processUpdate(
   if (cmd === "/start") return deps.send(chatId, START_TEXT);
   if (cmd === "/help") return deps.send(chatId, HELP_TEXT);
 
+  const startedAt = Date.now();
   try {
-    await deps.send(chatId, await deps.answer(message.text.trim()));
+    (deps.log ?? console).info?.("Telegram request received");
+    if (deps.sendChatAction) {
+      await deps.sendChatAction(chatId, "typing").catch((error) =>
+        (deps.log ?? console).error("Could not send Telegram chat action", error instanceof Error ? error.name : "UnknownError"),
+      );
+    }
+    const result = await deps.answer(message.text.trim());
+    const answer = typeof result === "string" ? { text: result, usedWebSearch: false } : result;
+    (deps.log ?? console).info?.("OpenAI request succeeded", {
+      durationMs: Date.now() - startedAt,
+      web_search_used: Boolean(answer.usedWebSearch),
+      source_count: answer.sourceCount ?? answer.sources?.length ?? 0,
+      deduplicated_source_count: answer.sources?.length ?? 0,
+      freshness_sensitive_query: Boolean(answer.freshnessSensitiveQuery),
+      freshness_warning: Boolean(answer.freshnessWarning),
+    });
+    await deps.send(chatId, answer.text);
   } catch (error) {
-    (deps.log ?? console).error("Could not generate or deliver an AI response", error);
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    (deps.log ?? console).error("Could not generate or deliver an AI response", {
+      durationMs: Date.now() - startedAt,
+      errorType,
+    });
     try {
-      await deps.send(chatId, "Сейчас не получилось получить ответ. Пожалуйста, попробуйте ещё раз через минуту.");
+      const localizedFallback = error && typeof error === "object" && "localizedFallback" in error
+        ? String(error.localizedFallback)
+        : undefined;
+      const isRussian = /[а-яё]/i.test(message.text);
+      const timedOut = errorType.toLowerCase().includes("timeout");
+      await deps.send(chatId, localizedFallback || (isRussian
+        ? timedOut
+          ? "Сейчас не удалось быстро проверить актуальную информацию. Попробуй ещё раз через минуту."
+          : "Сейчас не получилось получить ответ. Попробуй ещё раз через минуту."
+        : timedOut
+          ? "I couldn't check the latest information quickly enough. Please try again in a minute."
+          : "I couldn't get an answer right now. Please try again in a minute."));
     } catch (sendError) {
       (deps.log ?? console).error("Could not deliver the fallback message", sendError);
     }

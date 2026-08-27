@@ -2,7 +2,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 import { getConfig } from "../src/config.js";
 import { createAnswerGenerator } from "../src/openai.js";
-import { createTelegramSender, processUpdate, type TelegramUpdate } from "../src/telegram.js";
+import { createTelegramChatActionSender, createTelegramSender, processUpdate, type TelegramUpdate } from "../src/telegram.js";
 
 function secretMatches(received: string | undefined, expected: string): boolean {
   if (!received) return false;
@@ -40,6 +40,7 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
     await processUpdate(update, {
       answer: createAnswerGenerator(config.openaiApiKey, config.openaiModel),
       send: createTelegramSender(config.telegramBotToken),
+      sendChatAction: createTelegramChatActionSender(config.telegramBotToken),
     });
     res.writeHead(200, { "content-type": "application/json" }).end('{"ok":true}');
   } catch (error) {
