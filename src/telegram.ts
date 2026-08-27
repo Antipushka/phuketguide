@@ -4,7 +4,14 @@ export interface TelegramMessage { chat: { id: number }; text?: string }
 export interface TelegramUpdate { update_id?: number; message?: TelegramMessage }
 export type SendMessage = (chatId: number, text: string) => Promise<void>;
 export type SendChatAction = (chatId: number, action: "typing") => Promise<void>;
-export interface BotAnswer { text: string; usedWebSearch?: boolean; sources?: string[] }
+export interface BotAnswer {
+  text: string;
+  usedWebSearch?: boolean;
+  sources?: string[];
+  sourceCount?: number;
+  freshnessSensitiveQuery?: boolean;
+  freshnessWarning?: boolean;
+}
 
 export const START_TEXT = `Привет! Я PhuketGuide AI — твой AI-помощник по Пхукету.
 
@@ -92,7 +99,11 @@ export async function processUpdate(
     const answer = typeof result === "string" ? { text: result, usedWebSearch: false } : result;
     (deps.log ?? console).info?.("OpenAI request succeeded", {
       durationMs: Date.now() - startedAt,
-      usedWebSearch: Boolean(answer.usedWebSearch),
+      web_search_used: Boolean(answer.usedWebSearch),
+      source_count: answer.sourceCount ?? answer.sources?.length ?? 0,
+      deduplicated_source_count: answer.sources?.length ?? 0,
+      freshness_sensitive_query: Boolean(answer.freshnessSensitiveQuery),
+      freshness_warning: Boolean(answer.freshnessWarning),
     });
     await deps.send(chatId, answer.text);
   } catch (error) {
@@ -102,15 +113,18 @@ export async function processUpdate(
       errorType,
     });
     try {
+      const localizedFallback = error && typeof error === "object" && "localizedFallback" in error
+        ? String(error.localizedFallback)
+        : undefined;
       const isRussian = /[а-яё]/i.test(message.text);
       const timedOut = errorType.toLowerCase().includes("timeout");
-      await deps.send(chatId, isRussian
+      await deps.send(chatId, localizedFallback || (isRussian
         ? timedOut
           ? "Сейчас не удалось быстро проверить актуальную информацию. Попробуй ещё раз через минуту."
           : "Сейчас не получилось получить ответ. Попробуй ещё раз через минуту."
         : timedOut
           ? "I couldn't check the latest information quickly enough. Please try again in a minute."
-          : "I couldn't get an answer right now. Please try again in a minute.");
+          : "I couldn't get an answer right now. Please try again in a minute."));
     } catch (sendError) {
       (deps.log ?? console).error("Could not deliver the fallback message", sendError);
     }
