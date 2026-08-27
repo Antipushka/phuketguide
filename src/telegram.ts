@@ -1,13 +1,17 @@
 import { renderTelegramHtml } from "./rendering.js";
+import { renderStructuredResponse, validActionUrl } from "./responses/render.js";
+import type { StructuredResponse, TelegramActionRow } from "./responses/types.js";
 
 const TELEGRAM_CHUNK_SIZE = 4000;
 
 export interface TelegramMessage { chat: { id: number }; text?: string }
 export interface TelegramUpdate { update_id?: number; message?: TelegramMessage }
-export type SendMessage = (chatId: number, text: string) => Promise<void>;
+export type SendMessage = (chatId: number, text: string, actions?: TelegramActionRow[]) => Promise<void>;
 export type SendChatAction = (chatId: number, action: "typing") => Promise<void>;
 export interface BotAnswer {
   text: string;
+  structured?: StructuredResponse;
+  structuredResponseValid?: boolean;
   usedWebSearch?: boolean;
   sources?: string[];
   sourceCount?: number;
@@ -15,7 +19,7 @@ export interface BotAnswer {
   freshnessWarning?: boolean;
 }
 
-export const START_TEXT = `Привет! Я PhuketGuide AI — твой AI-помощник по Пхукету.
+export const START_TEXT = `Привет! Я Ploy — твой локальный помощник по Пхукету.
 
 Можешь просто написать, что тебя интересует: куда сходить, где поесть, какой район выбрать, где арендовать машину или байк, где жить или что посмотреть.
 
@@ -34,7 +38,8 @@ export function splitMessage(text: string, limit = TELEGRAM_CHUNK_SIZE): string[
   let rest = text.trim();
   while (rest.length > limit) {
     const candidate = rest.slice(0, limit + 1);
-    let cut = Math.max(candidate.lastIndexOf("\n"), candidate.lastIndexOf(" "));
+    let cut = candidate.lastIndexOf("\n\n");
+    if (cut < limit * 0.6) cut = Math.max(candidate.lastIndexOf("\n"), candidate.lastIndexOf(" "));
     if (cut < limit * 0.6) cut = limit;
     chunks.push(rest.slice(0, cut).trimEnd());
     rest = rest.slice(cut).trimStart();
@@ -44,12 +49,16 @@ export function splitMessage(text: string, limit = TELEGRAM_CHUNK_SIZE): string[
 }
 
 export function createTelegramSender(token: string): SendMessage {
-  return async (chatId, text) => {
-    for (const chunk of splitMessage(text)) {
+  return async (chatId, text, actions = []) => {
+    const chunks = splitMessage(text);
+    const safeActions = actions.slice(0, 5).map((row) => row.slice(0, 2).flatMap((action) => {
+      const url = validActionUrl(action.url); return url ? [{ text: action.text.slice(0, 64), url }] : [];
+    })).filter((row) => row.length);
+    for (const [index, chunk] of chunks.entries()) {
       const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ chat_id: chatId, text: chunk, parse_mode: "HTML", link_preview_options: { is_disabled: true } }),
+        body: JSON.stringify({ chat_id: chatId, text: chunk, parse_mode: "HTML", link_preview_options: { is_disabled: true }, ...(index === chunks.length - 1 && safeActions.length ? { reply_markup: { inline_keyboard: safeActions } } : {}) }),
         signal: AbortSignal.timeout(10_000),
       });
       if (!response.ok) throw new Error(`Telegram API request failed with status ${response.status}`);
@@ -99,6 +108,8 @@ export async function processUpdate(
     }
     const result = await deps.answer(message.text.trim());
     const answer = typeof result === "string" ? { text: result, usedWebSearch: false } : result;
+    const renderStartedAt = Date.now();
+    const rendered = answer.structured ? renderStructuredResponse(answer.structured) : undefined;
     (deps.log ?? console).info?.("OpenAI request succeeded", {
       durationMs: Date.now() - startedAt,
       web_search_used: Boolean(answer.usedWebSearch),
@@ -106,8 +117,13 @@ export async function processUpdate(
       deduplicated_source_count: answer.sources?.length ?? 0,
       freshness_sensitive_query: Boolean(answer.freshnessSensitiveQuery),
       freshness_warning: Boolean(answer.freshnessWarning),
+      response_kind: rendered?.kind ?? "general",
+      item_count: rendered?.itemCount ?? 0,
+      action_count: rendered?.actions.flat().length ?? 0,
+      structured_response_valid: answer.structuredResponseValid ?? Boolean(answer.structured),
+      render_duration_ms: Date.now() - renderStartedAt,
     });
-    await deps.send(chatId, renderTelegramHtml(answer.text));
+    await deps.send(chatId, rendered?.text ?? renderTelegramHtml(answer.text), rendered?.actions);
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     (deps.log ?? console).error("Could not generate or deliver an AI response", {
