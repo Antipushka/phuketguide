@@ -18,6 +18,10 @@ export interface BotAnswer {
   sourceCount?: number;
   freshnessSensitiveQuery?: boolean;
   freshnessWarning?: boolean;
+  realtimeEvidenceType?: "none" | "webpage" | "web_search_tool";
+  webpageSourceCount?: number;
+  realtimeToolEvidencePresent?: boolean;
+  freshnessWarningReason?: "none" | "no_search" | "no_realtime_evidence" | "historical_only";
 }
 
 export const START_TEXT = `Привет! Я Ploy — твой локальный помощник по Пхукету.
@@ -141,6 +145,10 @@ export async function processUpdate(
       deduplicated_source_count: answer.sources?.length ?? 0,
       freshness_sensitive_query: Boolean(answer.freshnessSensitiveQuery),
       freshness_warning: Boolean(answer.freshnessWarning),
+      realtime_evidence_type: answer.realtimeEvidenceType ?? "none",
+      webpage_source_count: answer.webpageSourceCount ?? answer.sources?.length ?? 0,
+      realtime_tool_evidence_present: Boolean(answer.realtimeToolEvidencePresent),
+      freshness_warning_reason: answer.freshnessWarningReason ?? "none",
       response_kind: rendered?.kind ?? "general",
       item_count: rendered?.itemCount ?? 0,
       action_count: rendered?.actions.flat().length ?? 0,

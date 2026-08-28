@@ -6,6 +6,7 @@ import { routeResponseKind } from "./responses/router.js";
 import { PLOY_RESPONSE_SCHEMA } from "./responses/schema.js";
 import { localizedSafeFallback, validateStructuredResponse } from "./responses/validate.js";
 import type { StructuredResponse } from "./responses/types.js";
+import { assessFreshness, isHistoricalReference, type FreshnessConfidence, type FreshnessRequirement } from "./freshness.js";
 
 export const OPENAI_TIMEOUT_MS = 25_000;
 
@@ -16,6 +17,12 @@ export interface AnswerResult {
   sourceCount: number;
   freshnessSensitiveQuery: boolean;
   freshnessWarning: boolean;
+  freshnessRequirement: FreshnessRequirement;
+  freshnessConfidence: FreshnessConfidence;
+  realtimeEvidenceType: "none" | "webpage" | "web_search_tool";
+  webpageSourceCount: number;
+  realtimeToolEvidencePresent: boolean;
+  freshnessWarningReason: "none" | "no_search" | "no_realtime_evidence" | "historical_only";
   structured?: StructuredResponse;
   structuredResponseValid: boolean;
 }
@@ -27,12 +34,14 @@ export interface ResponsesClient {
 const TRACKING_PARAMS = new Set(["fbclid", "gclid", "yclid", "ref", "referrer", "source"]);
 
 interface FreshnessRoute {
-  freshness_sensitive: boolean;
+  requirement: FreshnessRequirement;
   fallback: string;
   open_now?: boolean;
   current_weather?: boolean;
   response_kind?: string;
 }
+
+interface LegacyFreshnessRoute extends Partial<FreshnessRoute> { freshness_sensitive?: boolean }
 
 class LocalizedAnswerError extends Error {
   readonly localizedFallback: string;
@@ -47,7 +56,7 @@ class LocalizedAnswerError extends Error {
 async function classifyFreshness(client: ResponsesClient, model: string, question: string, signal: AbortSignal): Promise<FreshnessRoute> {
   const response = await client.responses.create({
     model,
-    instructions: `Classify semantically whether the user's request requires current or recently changing information (for example live weather, today's hours/events, current price/rate/status/availability). This must work for every language you understand; do not use keyword matching. Historical, seasonal, explanatory, and general advice questions are not freshness-sensitive. Also write one short fallback sentence in the user's language saying that sufficiently fresh information could not be confirmed and archived data will not be presented as current. Preserve proper nouns. Set open_now only when the user explicitly asks what is open at this moment (not merely today). Set current_weather only for a current weather observation.`,
+    instructions: `Classify the information need semantically in any language, never by keyword alone. requirement=realtime only for a claim about the state right now/today (live weather, exact current rate, open now, today's event or availability); requirement=current for changeable business information such as hours, menus, contacts, prices, rentals, venue details and recommendations; requirement=stable for comparisons, area/beach character, sights and general advice. An unqualified weather question (for example "Какая погода?", "Что с погодой?", "How's the weather?", or a Thai equivalent) means current weather in Phuket: set response_kind=weather, requirement=realtime and current_weather=true without asking a clarification. Phuket is the default location unless the user names another one. Write one short fallback in the user's language for the realtime claim only. Preserve proper nouns. Set open_now only when explicitly asking what is open at this moment.`,
     input: question,
     text: {
       format: {
@@ -57,21 +66,23 @@ async function classifyFreshness(client: ResponsesClient, model: string, questio
         schema: {
           type: "object",
           properties: {
-            freshness_sensitive: { type: "boolean" },
+            requirement: { type: "string", enum: ["realtime", "current", "stable"] },
             fallback: { type: "string" },
             open_now: { type: "boolean" },
             current_weather: { type: "boolean" },
             response_kind: { type: "string", enum: ["places_list", "place_detail", "weather", "events", "rate", "rental_list", "property_list", "area_recommendation", "comparison", "itinerary", "general"] },
           },
-          required: ["freshness_sensitive", "fallback", "open_now", "current_weather", "response_kind"],
+          required: ["requirement", "fallback", "open_now", "current_weather", "response_kind"],
           additionalProperties: false,
         },
       },
     },
     max_output_tokens: 100,
   }, { signal });
-  const route = JSON.parse(response.output_text) as FreshnessRoute;
-  if (typeof route.freshness_sensitive !== "boolean" || typeof route.fallback !== "string" || !route.fallback.trim()) {
+  const raw = JSON.parse(response.output_text) as LegacyFreshnessRoute;
+  // Compatibility is useful for in-flight responses during deployment and old test fixtures.
+  const route = { ...raw, requirement: raw.requirement ?? (raw.freshness_sensitive ? "realtime" : "stable") } as FreshnessRoute;
+  if (!["realtime", "current", "stable"].includes(route.requirement) || typeof route.fallback !== "string" || !route.fallback.trim()) {
     throw new Error("OpenAI returned an invalid freshness route");
   }
   return route;
@@ -112,18 +123,16 @@ function sourceReferences(response: Response): { cited: SourceReference[]; searc
   return { cited, searched };
 }
 
+/** The SDK exposes live web grounding as a completed web_search_call; sources are optional. */
+function completedWebSearch(response: Response): boolean {
+  return response.output.some((item) => item.type === "web_search_call" && item.status === "completed");
+}
+
 function deduplicateSources(sources: SourceReference[]): SourceReference[] {
   return [...new Map(sources.map((source) => {
     const url = normalizeSourceUrl(source.url);
     return [url, { ...source, url }];
   })).values()];
-}
-
-function looksHistorical(source: SourceReference, currentYear: number): boolean {
-  const decoded = decodeURIComponent(`${source.url} ${source.title ?? ""}`).toLowerCase();
-  if (/(?:archive|histor(?:y|ical)|climate|monthly|past-weather|weather-average|average-weather)/.test(decoded)) return true;
-  const years = decoded.match(/(?:19|20)\d{2}/g)?.map(Number) ?? [];
-  return years.some((year) => year < currentYear);
 }
 
 export function deduplicateParagraphs(text: string): string {
@@ -154,14 +163,14 @@ export async function generateAnswer(client: ResponsesClient, model: string, que
   const signal = AbortSignal.timeout(OPENAI_TIMEOUT_MS);
   const route = await classifyFreshness(client, model, question, signal);
   const responseKind = route.response_kind || routeResponseKind(question);
-  const freshnessSensitiveQuery = route.freshness_sensitive;
+  const freshnessSensitiveQuery = route.requirement !== "stable";
   const local = getPhuketDateTime();
   const today = local.date;
   let response: Response;
   try {
     response = await client.responses.create({
       model,
-      instructions: `${SYSTEM_PROMPT}\n\nThe language of THIS user message is authoritative; ignore earlier turns. ${phuketDateTimeContext()}. Return a structured ${responseKind} response, never HTML, Markdown, citations, source lists, or Telegram objects. Use language ru, en, th, or other for this message. Omit facts that were not reliably established. Lists contain 2–5 items and every recommendation item has a specific reason_to_choose. Link fields are only map_url, website_url, or instagram_url and must identify the exact official place. ${freshnessSensitiveQuery ? "Search for now/today with the current date; archives cannot prove current facts." : ""} ${route.open_now ? "OPEN NOW MODE: include only venues proven open at the supplied Phuket weekday/time; exclude closed or unknown venues and cap at 5." : ""} ${route.current_weather ? "CURRENT WEATHER MODE: return current conditions and at most a short today_summary unless a multi-day forecast was requested." : ""}`,
+      instructions: `${SYSTEM_PROMPT}\n\nThe language of THIS user message is authoritative; ignore earlier turns. ${phuketDateTimeContext()}. Freshness requirement: ${route.requirement}. Return a structured ${responseKind} response, never HTML, Markdown, citations, source lists, confidence metadata, clarifying questions, or Telegram objects. Use language ru, en, th, or other for this message. Give the best reliable answer; an undated official active page is usable and is not stale merely because it has no publication date. Prefer authority and relevance, note a material uncertainty at most once, and preserve every useful part of an answer even when an exact live value cannot be established. Never present archives or historical averages as current. Lists contain 2–5 items and every recommendation item has a specific reason_to_choose. Link fields are only map_url, website_url, or instagram_url and must identify the exact official place. ${freshnessSensitiveQuery ? "Search for relevant evidence; for realtime claims include now/today and the current date." : "Freshness must not block this stable answer."} ${route.open_now ? "OPEN NOW MODE: derive status against the supplied Phuket weekday/time from a reliable published schedule (an official schedule need not have a publication date). Conflicting schedules mean unknown. Include only confirmed open venues; exclude closed or unknown and cap at 5." : ""} ${route.current_weather ? "CURRENT WEATHER MODE: the user means current Phuket weather when no location or period was stated. Search now and answer directly; do not ask what time or location they mean. Return current conditions and at most a short today_summary unless a forecast was requested. If unavailable, use the freshness fallback and do not substitute climate/history." : ""}`,
       input: question,
       tools: [{ type: "web_search", external_web_access: true, search_context_size: "medium", user_location: { type: "approximate", city: "Phuket", region: "Phuket", country: "TH", timezone: "Asia/Bangkok" } }],
       tool_choice: freshnessSensitiveQuery ? "required" : "auto",
@@ -177,13 +186,27 @@ export async function generateAnswer(client: ResponsesClient, model: string, que
   const evidenceSources = rawSources.cited.length ? rawSources.cited : rawSources.searched;
   const uniqueSources = deduplicateSources(evidenceSources);
   const sources = uniqueSources.map((source) => source.url);
-  const freshnessWarning = freshnessSensitiveQuery && (!usedWebSearch || uniqueSources.length === 0 || uniqueSources.every((source) => looksHistorical(source, Number(today.slice(0, 4)))));
+  const evidence = uniqueSources.map((source) => ({ authority: "editorial" as const, historical: isHistoricalReference(source.url, source.title, Number(today.slice(0, 4))) }));
+  const assessment = assessFreshness(route.requirement, evidence);
   let parsed: unknown;
   try { parsed = JSON.parse(response.output_text); } catch { parsed = undefined; }
   const validated = validateStructuredResponse(parsed);
+  const allWebpagesHistorical = uniqueSources.length > 0 && evidence.every((source) => source.historical);
+  // In the current SDK there is no separate weather output item. A completed
+  // web_search_call is the documented tool evidence; its URL sources are optional.
+  const realtimeToolEvidencePresent = Boolean(route.current_weather && validated?.kind === "weather" && completedWebSearch(response) && uniqueSources.length === 0);
+  const hasRealtimeEvidence = assessment.canAnswer || realtimeToolEvidencePresent;
+  const freshnessWarningReason = route.requirement !== "realtime" || hasRealtimeEvidence
+    ? "none"
+    : !usedWebSearch ? "no_search" : allWebpagesHistorical ? "historical_only" : "no_realtime_evidence";
+  const freshnessWarning = freshnessWarningReason !== "none";
+  const realtimeEvidenceType = realtimeToolEvidencePresent ? "web_search_tool" : assessment.canAnswer && uniqueSources.length ? "webpage" : "none";
   const fallbackStructured: StructuredResponse = { kind: "freshness_fallback", language: "other", heading: route.fallback.trim(), explanation: route.fallback.trim() };
   const safeFallback = localizedSafeFallback(question);
-  const structured = freshnessWarning ? fallbackStructured : (validated ?? safeFallback);
+  let structured = freshnessWarning ? fallbackStructured : (validated ?? safeFallback);
+  if (route.open_now && structured.kind === "places_list") {
+    structured = { ...structured, items: structured.items.filter((item) => item.open_status === "open").slice(0, 5) };
+  }
   // output_text is transport only in structured mode. It is never user-facing.
   const text = freshnessWarning ? route.fallback.trim() : safeFallback.explanation;
   if (!text.trim()) throw new Error("OpenAI returned an empty response");
@@ -194,6 +217,12 @@ export async function generateAnswer(client: ResponsesClient, model: string, que
     sourceCount: evidenceSources.length,
     freshnessSensitiveQuery,
     freshnessWarning,
+    freshnessRequirement: route.requirement,
+    freshnessConfidence: assessment.confidence,
+    realtimeEvidenceType,
+    webpageSourceCount: uniqueSources.length,
+    realtimeToolEvidencePresent,
+    freshnessWarningReason,
     structured,
     structuredResponseValid: Boolean(validated),
   };
