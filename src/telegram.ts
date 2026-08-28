@@ -1,5 +1,3 @@
-import { renderTelegramHtml } from "./rendering.js";
-
 const TELEGRAM_CHUNK_SIZE = 4000;
 
 export interface TelegramMessage { chat: { id: number }; text?: string }
@@ -49,7 +47,7 @@ export function createTelegramSender(token: string): SendMessage {
       const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ chat_id: chatId, text: chunk, parse_mode: "HTML", link_preview_options: { is_disabled: true } }),
+        body: JSON.stringify({ chat_id: chatId, text: chunk }),
         signal: AbortSignal.timeout(10_000),
       });
       if (!response.ok) throw new Error(`Telegram API request failed with status ${response.status}`);
@@ -107,7 +105,7 @@ export async function processUpdate(
       freshness_sensitive_query: Boolean(answer.freshnessSensitiveQuery),
       freshness_warning: Boolean(answer.freshnessWarning),
     });
-    await deps.send(chatId, renderTelegramHtml(answer.text));
+    await deps.send(chatId, answer.text);
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     (deps.log ?? console).error("Could not generate or deliver an AI response", {

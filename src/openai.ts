@@ -1,7 +1,6 @@
 import OpenAI from "openai";
 import type { Response } from "openai/resources/responses/responses";
 import { SYSTEM_PROMPT } from "./prompt.js";
-import { phuketDateTimeContext } from "./time.js";
 
 export const OPENAI_TIMEOUT_MS = 25_000;
 
@@ -10,6 +9,8 @@ export interface AnswerResult {
   usedWebSearch: boolean;
   sources: string[];
   sourceCount: number;
+  freshnessSensitiveQuery: boolean;
+  freshnessWarning: boolean;
 }
 
 export interface ResponsesClient {
@@ -17,6 +18,51 @@ export interface ResponsesClient {
 }
 
 const TRACKING_PARAMS = new Set(["fbclid", "gclid", "yclid", "ref", "referrer", "source"]);
+
+interface FreshnessRoute {
+  freshness_sensitive: boolean;
+  fallback: string;
+}
+
+class LocalizedAnswerError extends Error {
+  readonly localizedFallback: string;
+
+  constructor(cause: unknown, localizedFallback: string) {
+    super(cause instanceof Error ? cause.message : "OpenAI request failed", { cause });
+    this.name = cause instanceof Error ? cause.name : "OpenAIError";
+    this.localizedFallback = localizedFallback;
+  }
+}
+
+async function classifyFreshness(client: ResponsesClient, model: string, question: string, signal: AbortSignal): Promise<FreshnessRoute> {
+  const response = await client.responses.create({
+    model,
+    instructions: `Classify semantically whether the user's request requires current or recently changing information (for example live weather, today's hours/events, current price/rate/status/availability). This must work for every language you understand; do not use keyword matching. Historical, seasonal, explanatory, and general advice questions are not freshness-sensitive. Also write one short fallback sentence in the user's language saying that sufficiently fresh information could not be confirmed and archived data will not be presented as current. Preserve proper nouns.`,
+    input: question,
+    text: {
+      format: {
+        type: "json_schema",
+        name: "freshness_route",
+        strict: true,
+        schema: {
+          type: "object",
+          properties: {
+            freshness_sensitive: { type: "boolean" },
+            fallback: { type: "string" },
+          },
+          required: ["freshness_sensitive", "fallback"],
+          additionalProperties: false,
+        },
+      },
+    },
+    max_output_tokens: 100,
+  }, { signal });
+  const route = JSON.parse(response.output_text) as FreshnessRoute;
+  if (typeof route.freshness_sensitive !== "boolean" || typeof route.fallback !== "string" || !route.fallback.trim()) {
+    throw new Error("OpenAI returned an invalid freshness route");
+  }
+  return route;
+}
 
 export function normalizeSourceUrl(value: string): string {
   try {
@@ -60,6 +106,13 @@ function deduplicateSources(sources: SourceReference[]): SourceReference[] {
   })).values()];
 }
 
+function looksHistorical(source: SourceReference, currentYear: number): boolean {
+  const decoded = decodeURIComponent(`${source.url} ${source.title ?? ""}`).toLowerCase();
+  if (/(?:archive|histor(?:y|ical)|climate|monthly|past-weather|weather-average|average-weather)/.test(decoded)) return true;
+  const years = decoded.match(/(?:19|20)\d{2}/g)?.map(Number) ?? [];
+  return years.some((year) => year < currentYear);
+}
+
 export function deduplicateParagraphs(text: string): string {
   const seen = new Set<string>();
   return text.trim().split(/\n\s*\n/).filter((paragraph) => {
@@ -73,44 +126,42 @@ export function deduplicateParagraphs(text: string): string {
   }).join("\n\n");
 }
 
-/** Final safety gate for model-produced open-now lists. Venue blocks must carry a verified marker. */
-export function filterOpenNowAnswer(text: string, fallback: string): string {
-  const blocks = text.trim().split(/\n\s*\n/);
-  const verified = blocks.filter((block) => /\[STATUS:OPEN]/i.test(block)).slice(0, 5);
-  if (!verified.length) return fallback.trim();
-  const intro = blocks.find((block) => !/\[STATUS:(?:OPEN|CLOSED|UNKNOWN)]/i.test(block));
-  return [intro, ...verified].filter(Boolean).join("\n\n").replace(/\s*\[STATUS:OPEN]\s*/gi, "").trim();
-}
-
 /** Runs one Responses API request and lets the model decide whether search is needed. */
 export async function generateAnswer(client: ResponsesClient, model: string, question: string): Promise<AnswerResult> {
+  // One shared deadline covers both the semantic router and the answer/search call.
   const signal = AbortSignal.timeout(OPENAI_TIMEOUT_MS);
+  const route = await classifyFreshness(client, model, question, signal);
+  const freshnessSensitiveQuery = route.freshness_sensitive;
+  const today = new Date().toISOString().slice(0, 10);
   let response: Response;
   try {
     response = await client.responses.create({
       model,
-      instructions: `${SYSTEM_PROMPT}\n\nThe language of THIS user message is authoritative; ignore the language of earlier turns. ${phuketDateTimeContext()}.`,
+      instructions: `${SYSTEM_PROMPT}\n\nТекущая дата: ${today}. ${freshnessSensitiveQuery ? "Запрос зависит от свежести: сформулируй поисковый запрос с now/today и текущей датой; не используй архив как подтверждение текущего состояния." : ""}`,
       input: question,
-      tools: [{ type: "web_search", external_web_access: true, search_context_size: "medium", user_location: { type: "approximate", city: "Phuket", region: "Phuket", country: "TH", timezone: "Asia/Bangkok" } }],
-      tool_choice: "auto",
+      tools: [{ type: "web_search", external_web_access: true, search_context_size: "medium" }],
+      tool_choice: freshnessSensitiveQuery ? "required" : "auto",
       include: ["web_search_call.action.sources"],
       max_output_tokens: 900,
     }, { signal });
   } catch (error) {
-    throw error;
+    throw new LocalizedAnswerError(error, route.fallback.trim());
   }
   const usedWebSearch = response.output.some((item) => item.type === "web_search_call");
   const rawSources = sourceReferences(response);
   const evidenceSources = rawSources.cited.length ? rawSources.cited : rawSources.searched;
   const uniqueSources = deduplicateSources(evidenceSources);
   const sources = uniqueSources.map((source) => source.url);
-  const text = deduplicateParagraphs(response.output_text);
+  const freshnessWarning = freshnessSensitiveQuery && (!usedWebSearch || uniqueSources.length === 0 || uniqueSources.every((source) => looksHistorical(source, Number(today.slice(0, 4)))));
+  const text = freshnessWarning ? route.fallback.trim() : deduplicateParagraphs(response.output_text);
   if (!text.trim()) throw new Error("OpenAI returned an empty response");
   return {
     text,
     usedWebSearch,
     sources,
     sourceCount: evidenceSources.length,
+    freshnessSensitiveQuery,
+    freshnessWarning,
   };
 }
 
