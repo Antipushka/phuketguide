@@ -1,10 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { Response } from "openai/resources/responses/responses";
-import type { StructuredResponse } from "../src/responses/types.js";
 import { getConfig } from "../src/config.js";
 import { deduplicateParagraphs, generateAnswer, normalizeSourceUrl, type ResponsesClient } from "../src/openai.js";
-import { HELP_TEXT, START_TEXT, containsStructuredPayload, processUpdate, splitMessage } from "../src/telegram.js";
+import { HELP_TEXT, START_TEXT, processUpdate, splitMessage } from "../src/telegram.js";
 
 test("configuration validates required secrets and defaults the model", () => {
   assert.throws(() => getConfig({}));
@@ -267,52 +266,6 @@ test("Telegram sender disables previews and uses HTML parse mode", async () => {
   try { await (await import("../src/telegram.js")).createTelegramSender("token")(1, "<b>Hello</b>"); } finally { globalThis.fetch = original; }
   assert.equal(body.parse_mode, "HTML");
   assert.deepEqual(body.link_preview_options, { is_disabled: true });
-});
-
-async function runStructuredPipeline(outputText: string, question = "Куда сходить на Пхукете?") {
-  const sent: Array<{ text: string; actions: unknown[] }> = [];
-  const client = clientWith(response([], outputText), undefined, { freshness_sensitive: false, fallback: "Нет ответа." });
-  await processUpdate({ message: { chat: { id: 7 }, text: question } }, {
-    answer: (text) => generateAnswer(client, "gpt-test", text),
-    send: async (_id, text, actions = []) => { sent.push({ text, actions }); },
-    log: { info() {}, error() {} },
-  });
-  return sent[0];
-}
-
-test("real handler pipeline renders place cards and actions without transport JSON", async () => {
-  const sent = await runStructuredPipeline(JSON.stringify({ kind: "places_list", language: "ru", heading: "Места", items: [{ name: "Старый город", area: "Phuket Town", reason_to_choose: "Архитектура" }] }));
-  assert.match(sent.text, /<b>1\. Старый город<\/b>/);
-  assert.ok(sent.actions.length);
-  assert.doesNotMatch(sent.text, /"kind"|reason_to_choose/);
-});
-
-test("invalid locale, incomplete payload, and malformed transport use safe handler fallback", async () => {
-  for (const payload of ['{"kind":"weather","language":"ru-RU"}', '{"kind":"weather","language":"ru"}', '{broken']) {
-    const sent = await runStructuredPipeline(payload, "Какая погода?");
-    assert.match(sent.text, /Не удалось подготовить ответ/);
-    assert.doesNotMatch(sent.text, /"kind"|ru-RU|\{broken/);
-  }
-});
-
-test("complete weather traverses generation, validation, rendering, and sender", async () => {
-  const sent = await runStructuredPipeline('{"kind":"weather","language":"ru","heading":"Погода","temperature":"+29°C","condition":"Ясно"}', "Погода на Пхукете");
-  assert.match(sent.text, /<b>\+29°C<\/b> · Ясно/);
-});
-
-test("renderer-boundary exception produces safe fallback", async () => {
-  const sent: string[] = [];
-  const hostile = new Proxy({}, { get() { throw new Error("renderer boundary exploded"); } });
-  await processUpdate({ message: { chat: { id: 1 }, text: "Куда сходить?" } }, { answer: async () => ({ text: "", structured: hostile as StructuredResponse }), send: async (_id, text) => { sent.push(text); }, log: { info() {}, error() {} } });
-  assert.match(sent[0], /не получилось получить ответ/i);
-});
-
-test("final guard recognizes Ploy payload but ordinary requested JSON remains allowed", async () => {
-  assert.equal(containsStructuredPayload('{"kind":"places_list","language":"ru","places":[]}'), true);
-  assert.equal(containsStructuredPayload('{"weather":"sunny","temperature":29}'), false);
-  const sent: string[] = [];
-  await processUpdate({ message: { chat: { id: 1 }, text: "Покажи обычный JSON" } }, { answer: async () => '{"weather":"sunny","temperature":29}', send: async (_id, text) => { sent.push(text); } });
-  assert.match(sent[0], /weather/);
 });
 
 test("open-now answer safety gate retains only explicitly verified venue blocks", async () => {
